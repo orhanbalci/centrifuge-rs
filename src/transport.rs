@@ -1,13 +1,11 @@
 use super::protocol::{Command, Reply};
 use anyhow::Result;
 use prost::Message as PMessage;
-use std::sync::mpsc::{Receiver, Sender};
-use std::{net::TcpStream, sync::mpsc::channel};
+use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, SendError, Sender};
+use std::thread::{self, JoinHandle};
 use thiserror::Error;
-use tungstenite::Message as TMessage;
-use tungstenite::{
-    client::IntoClientRequest, connect, stream::MaybeTlsStream, Error as TError, WebSocket,
-};
+use websocket::{ClientBuilder, OwnedMessage, WebSocketError};
 
 use prost::{DecodeError, EncodeError};
 
@@ -19,11 +17,6 @@ pub enum TransportError {
     SocketClosed,
     #[error("Reply Not Ready")]
     ReplyNotReady,
-    #[error("Websocket Error")]
-    WebsocketError {
-        #[from]
-        source: TError,
-    },
     #[error("Protobuf Decode Error")]
     ProtobufDecodeError {
         #[from]
@@ -33,6 +26,16 @@ pub enum TransportError {
     ProtobufEncodeError {
         #[from]
         source: EncodeError,
+    },
+    #[error("MessageQueue Error")]
+    MessageQueueError {
+        #[from]
+        source: SendError<OwnedMessage>,
+    },
+    #[error("WebSocket Error")]
+    WebSocketError {
+        #[from]
+        source: WebSocketError,
     },
 }
 
@@ -49,30 +52,106 @@ pub trait Transport<R, W> {
 
 pub struct WebsocketTransport {
     protocol_type: ProtocolType,
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
-    reply_tx: Sender<Reply>,
-    reply_rc: Receiver<Reply>,
-    disconnect_rc: Receiver<bool>,
+    request_tx: Sender<OwnedMessage>,
+    reply_rc: Receiver<OwnedMessage>,
+    // disconnect_rc: Receiver<bool>,
+    sender_loop: JoinHandle<()>,
+    receiver_loop: JoinHandle<()>,
     closed: bool,
 }
 
 impl WebsocketTransport {
-    pub fn new<T>(
-        url: T,
+    pub fn new(
+        url: &str,
         protocol_type: ProtocolType,
-        disconnect_rc: Receiver<bool>,
-    ) -> CResult<Self>
-    where
-        T: IntoClientRequest,
-    {
-        let (socket, _) = connect(url)?;
+        // disconnect_rc: Receiver<bool>,
+    ) -> CResult<Self> {
+        let client = ClientBuilder::new(url)
+            .unwrap()
+            .add_protocol("rust-websocket")
+            .connect_insecure()?;
+
+        println!("Successfully connected");
+
+        let (mut receiver, mut sender) = client.split().unwrap();
+
+        let (request_tx, rx) = channel();
         let (reply_tx, reply_rc) = channel();
+
+        let tx_1 = request_tx.clone();
+
+        let send_loop = thread::spawn(move || {
+            loop {
+                // Send loop
+                let message = match rx.recv() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        println!("Send Loop: {:?}", e);
+                        return;
+                    }
+                };
+                match message {
+                    OwnedMessage::Close(_) => {
+                        let _ = sender.send_message(&message);
+                        // If it's a close message, just send it and then return.
+                        return;
+                    }
+                    _ => (),
+                }
+                // Send the message
+                match sender.send_message(&message) {
+                    Ok(()) => (),
+                    Err(e) => {
+                        println!("Send Loop: {:?}", e);
+                        let _ = sender.send_message(&OwnedMessage::Close(None));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let receive_loop = thread::spawn(move || {
+            // Receive loop
+            for message in receiver.incoming_messages() {
+                let message = match message {
+                    Ok(m) => m,
+                    Err(e) => {
+                        println!("Receive Loop: {:?}", e);
+                        let _ = tx_1.send(OwnedMessage::Close(None));
+                        return;
+                    }
+                };
+                match message {
+                    OwnedMessage::Close(_) => {
+                        // Got a close message, so send a close message and return
+                        let _ = tx_1.send(OwnedMessage::Close(None));
+                        return;
+                    }
+                    OwnedMessage::Ping(data) => {
+                        match tx_1.send(OwnedMessage::Pong(data)) {
+                            // Send a pong in response
+                            Ok(()) => (),
+                            Err(e) => {
+                                println!("Receive Loop: {:?}", e);
+                                return;
+                            }
+                        }
+                    }
+                    // Say what we received
+                    _ => {
+                        println!("Receive Loop: {:?}", message);
+                        let _ = reply_tx.send(message);
+                    }
+                }
+            }
+        });
+
         Ok(WebsocketTransport {
             protocol_type,
-            socket,
-            reply_tx,
+            request_tx,
             reply_rc,
-            disconnect_rc,
+            sender_loop: send_loop,
+            receiver_loop: receive_loop,
             closed: false,
         })
     }
@@ -81,7 +160,16 @@ impl WebsocketTransport {
 impl Transport<Reply, ()> for WebsocketTransport {
     fn read(&self) -> CResult<Reply> {
         if let Some(next_reply) = self.reply_rc.iter().next() {
-            Ok(next_reply)
+            match next_reply {
+                OwnedMessage::Text(txt) => todo!(),
+                OwnedMessage::Binary(bin) => {
+                    crate::protocol::Reply::decode_length_delimited(&bin[..])
+                        .map_err(|err| err.into())
+                }
+                OwnedMessage::Close(_) => Err(TransportError::SocketClosed),
+                OwnedMessage::Ping(_) => Err(TransportError::SocketClosed),
+                OwnedMessage::Pong(_) => Err(TransportError::SocketClosed),
+            }
         } else if self.closed {
             Err(TransportError::SocketClosed)
         } else {
@@ -92,21 +180,24 @@ impl Transport<Reply, ()> for WebsocketTransport {
     fn write(&mut self, cmd: Command) -> CResult<()> {
         match self.protocol_type {
             ProtocolType::Json => self
-                .socket
-                .write_message(TMessage::Text(serde_json::to_string(&cmd).unwrap()))
+                .request_tx
+                .send(OwnedMessage::Text(serde_json::to_string(&cmd).unwrap()))
                 .map_err(|err| err.into()),
             ProtocolType::Protobuf => {
                 let mut buffer: Vec<u8> = Vec::with_capacity(50);
                 cmd.encode_length_delimited(&mut buffer)?;
                 return self
-                    .socket
-                    .write_message(TMessage::Binary(buffer))
+                    .request_tx
+                    .send(OwnedMessage::Binary(buffer))
                     .map_err(|err| err.into());
             }
         }
     }
 
     fn close(&mut self) -> CResult<()> {
-        self.socket.close(None).map_err(|err| err.into())
+        //TODO handle thread joins gracefully
+        self.request_tx
+            .send(OwnedMessage::Close(None))
+            .map_err(|err| err.into())
     }
 }
