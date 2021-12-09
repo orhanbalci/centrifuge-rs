@@ -1,77 +1,108 @@
-use super::protocol::{Command, Reply};
-use anyhow::Result;
+use crate::error::CentrifugeError;
+
+use super::{
+    error::CentrifugeResult,
+    protocol::{Command, Reply},
+};
+use httparse::Header;
 use prost::Message as PMessage;
 use std::sync::mpsc::channel;
-use std::sync::mpsc::{Receiver, SendError, Sender};
-use std::thread::{self, JoinHandle};
-use thiserror::Error;
-use websocket::{ClientBuilder, OwnedMessage, WebSocketError};
-
-use prost::{DecodeError, EncodeError};
-
-type CResult<T> = Result<T, TransportError>;
-
-#[derive(Error, Debug)]
-pub enum TransportError {
-    #[error("Socket closed")]
-    SocketClosed,
-    #[error("Reply Not Ready")]
-    ReplyNotReady,
-    #[error("Protobuf Decode Error")]
-    ProtobufDecodeError {
-        #[from]
-        source: DecodeError,
-    },
-    #[error("Protobuf Encode Error")]
-    ProtobufEncodeError {
-        #[from]
-        source: EncodeError,
-    },
-    #[error("MessageQueue Error")]
-    MessageQueueError {
-        #[from]
-        source: SendError<OwnedMessage>,
-    },
-    #[error("WebSocket Error")]
-    WebSocketError {
-        #[from]
-        source: WebSocketError,
-    },
-}
-
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::{self};
+use websocket::{header::Headers, ClientBuilder, OwnedMessage};
 pub enum ProtocolType {
     Json,
     Protobuf,
 }
 
 pub trait Transport<R, W> {
-    fn read(&self) -> CResult<R>;
-    fn write(&mut self, cmd: Command) -> CResult<W>;
-    fn close(&mut self) -> CResult<W>;
+    fn read(&self) -> CentrifugeResult<R>;
+    fn write(&mut self, cmd: Command) -> CentrifugeResult<W>;
+    fn close(&mut self) -> CentrifugeResult<W>;
 }
 
 pub struct WebsocketTransport {
+    url: String,
     protocol_type: ProtocolType,
-    request_tx: Sender<OwnedMessage>,
-    reply_rc: Receiver<OwnedMessage>,
-    // disconnect_rc: Receiver<bool>,
-    sender_loop: JoinHandle<()>,
-    receiver_loop: JoinHandle<()>,
+    request_tx: Option<Sender<OwnedMessage>>,
+    reply_rc: Option<Receiver<OwnedMessage>>,
     closed: bool,
 }
 
 impl WebsocketTransport {
-    pub fn new(
-        url: &str,
-        protocol_type: ProtocolType,
-        // disconnect_rc: Receiver<bool>,
-    ) -> CResult<Self> {
-        let client = ClientBuilder::new(url)
+    pub fn new(url: String, protocol_type: ProtocolType) -> Self {
+        WebsocketTransport {
+            url,
+            protocol_type,
+            request_tx: None,
+            reply_rc: None,
+            closed: false,
+        }
+    }
+}
+
+impl Transport<Reply, ()> for WebsocketTransport {
+    fn read(&self) -> CentrifugeResult<Reply> {
+        if let Some(rc) = &self.reply_rc {
+            if let Some(next_reply) = rc.iter().next() {
+                match next_reply {
+                    OwnedMessage::Text(txt) => todo!(),
+                    OwnedMessage::Binary(bin) => {
+                        crate::protocol::Reply::decode_length_delimited(&bin[..])
+                            .map_err(|err| err.into())
+                    }
+                    OwnedMessage::Close(_) => Err(CentrifugeError::SocketClosed),
+                    OwnedMessage::Ping(_) => Err(CentrifugeError::SocketClosed),
+                    OwnedMessage::Pong(_) => Err(CentrifugeError::SocketClosed),
+                }
+            } else if self.closed {
+                Err(CentrifugeError::SocketClosed)
+            } else {
+                Err(CentrifugeError::ReplyNotReady)
+            }
+        } else {
+            Err(CentrifugeError::ReceiveChannelNotReady)
+        }
+    }
+
+    fn write(&mut self, cmd: Command) -> CentrifugeResult<()> {
+        if let Some(tx) = &self.request_tx {
+            match self.protocol_type {
+                ProtocolType::Json => tx
+                    .send(OwnedMessage::Text(serde_json::to_string(&cmd).unwrap()))
+                    .map_err(|err| err.into()),
+                ProtocolType::Protobuf => {
+                    let mut buffer: Vec<u8> = Vec::with_capacity(50);
+                    cmd.encode_length_delimited(&mut buffer)?;
+                    return tx
+                        .send(OwnedMessage::Binary(buffer))
+                        .map_err(|err| err.into());
+                }
+            }
+        } else {
+            Err(CentrifugeError::TransmitChannelNotReady)
+        }
+    }
+
+    fn close(&mut self) -> CentrifugeResult<()> {
+        //TODO handle thread joins gracefully
+        if let Some(tx) = &self.request_tx {
+            tx.send(OwnedMessage::Close(None)).map_err(|err| err.into())
+        } else {
+            Err(CentrifugeError::TransmitChannelNotReady)
+        }
+    }
+}
+
+impl WebsocketTransport {
+    pub fn connect(&mut self, headers: &Vec<Header>) -> CentrifugeResult<bool> {
+        let headers =
+            Headers::from_raw(&headers[..]).map_err(|_| CentrifugeError::HttpHeaderError)?;
+        let client = ClientBuilder::new(&self.url)
             .unwrap()
             .add_protocol("rust-websocket")
+            .custom_headers(&headers)
             .connect_insecure()?;
-
-        println!("Successfully connected");
 
         let (mut receiver, mut sender) = client.split().unwrap();
 
@@ -79,6 +110,8 @@ impl WebsocketTransport {
         let (reply_tx, reply_rc) = channel();
 
         let tx_1 = request_tx.clone();
+        self.request_tx = Some(request_tx);
+        self.reply_rc = Some(reply_rc);
 
         let send_loop = thread::spawn(move || {
             loop {
@@ -146,58 +179,7 @@ impl WebsocketTransport {
             }
         });
 
-        Ok(WebsocketTransport {
-            protocol_type,
-            request_tx,
-            reply_rc,
-            sender_loop: send_loop,
-            receiver_loop: receive_loop,
-            closed: false,
-        })
-    }
-}
-
-impl Transport<Reply, ()> for WebsocketTransport {
-    fn read(&self) -> CResult<Reply> {
-        if let Some(next_reply) = self.reply_rc.iter().next() {
-            match next_reply {
-                OwnedMessage::Text(txt) => todo!(),
-                OwnedMessage::Binary(bin) => {
-                    crate::protocol::Reply::decode_length_delimited(&bin[..])
-                        .map_err(|err| err.into())
-                }
-                OwnedMessage::Close(_) => Err(TransportError::SocketClosed),
-                OwnedMessage::Ping(_) => Err(TransportError::SocketClosed),
-                OwnedMessage::Pong(_) => Err(TransportError::SocketClosed),
-            }
-        } else if self.closed {
-            Err(TransportError::SocketClosed)
-        } else {
-            Err(TransportError::ReplyNotReady)
-        }
-    }
-
-    fn write(&mut self, cmd: Command) -> CResult<()> {
-        match self.protocol_type {
-            ProtocolType::Json => self
-                .request_tx
-                .send(OwnedMessage::Text(serde_json::to_string(&cmd).unwrap()))
-                .map_err(|err| err.into()),
-            ProtocolType::Protobuf => {
-                let mut buffer: Vec<u8> = Vec::with_capacity(50);
-                cmd.encode_length_delimited(&mut buffer)?;
-                return self
-                    .request_tx
-                    .send(OwnedMessage::Binary(buffer))
-                    .map_err(|err| err.into());
-            }
-        }
-    }
-
-    fn close(&mut self) -> CResult<()> {
-        //TODO handle thread joins gracefully
-        self.request_tx
-            .send(OwnedMessage::Close(None))
-            .map_err(|err| err.into())
+        // if client is created connection is ok
+        return Ok(true);
     }
 }
