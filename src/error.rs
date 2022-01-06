@@ -1,9 +1,7 @@
 use std::sync::mpsc::SendError;
 
-use anyhow::Result;
 use prost::{DecodeError, EncodeError};
 use thiserror::Error;
-use websocket::{OwnedMessage, WebSocketError};
 
 pub type CentrifugeResult<T> = Result<T, CentrifugeError>;
 
@@ -23,20 +21,15 @@ pub enum CentrifugeError {
         #[from]
         source: EncodeError,
     },
-    #[error("MessageQueue Error")]
-    MessageQueueError {
-        #[from]
-        source: SendError<OwnedMessage>,
-    },
-    #[error("WebSocket Error")]
-    WebSocketError {
-        #[from]
-        source: WebSocketError,
-    },
     #[error("Receive channel not readey")]
     ReceiveChannelNotReady,
     #[error("Transmit channel not readey")]
     TransmitChannelNotReady,
     #[error("Can not parse http header")]
     HttpHeaderError,
+    #[error("Websocket error")]
+    WebsocketError {
+        #[from]
+        source: async_tungstenite::tungstenite::Error,
+    },
 }

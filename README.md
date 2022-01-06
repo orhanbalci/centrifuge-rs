@@ -4,9 +4,9 @@ centrifugo server rust client
 ## Feature matrix
 
 - [ ] connect to server using JSON protocol format
-- [ ] connect to server using Protobuf protocol format
-- [ ] connect with token (JWT)
-- [ ] connect with custom header
+- [x] connect to server using Protobuf protocol format
+- [x] connect with token (JWT)
+- [x] connect with custom header
 - [ ] automatic reconnect in case of errors, network problems etc
 - [ ] an exponential backoff for reconnect
 - [ ] connect and disconnect events
